@@ -52,7 +52,7 @@ def main():
                 # 자막이 없는 경우 영상 설명란 사용
                 transcript_text = entry.get('summary', '자막 없음')
 
-            # 제미나이 요약 요청
+            # 제미나이 요약 요청 (최신 모델 gemini-3.8-flash 적용)
             prompt = f"""
 다음은 유튜브 영상 '{video_title}'의 자막/내용입니다.
 영상의 핵심 내용과 중요한 포인트를 한국어로 읽기 쉽게 3~5줄 내외의 글머리 기호로 요약해 주세요.
@@ -62,7 +62,7 @@ def main():
 """
             try:
                 response = client.models.generate_content(
-                    model='gemini-2.5-flash',
+                    model='gemini-3.8-flash',
                     contents=prompt
                 )
                 summary = response.text
