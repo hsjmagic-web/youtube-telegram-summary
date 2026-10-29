@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import re
 from datetime import datetime, timezone, timedelta
 import zoneinfo
 import holidays
@@ -17,10 +16,6 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# ==========================================
-# [설정] 수집 대상 시간대 (KST 기준)
-# 기본값: 당일 00:00 ~ 당일 08:00
-# ==========================================
 START_DAYS_AGO = 0
 START_HOUR = 0
 END_HOUR = 8
@@ -53,19 +48,18 @@ def is_korean_trading_day():
     return True
 
 def clean_and_shrink_text(text, max_chars=1800):
-    """무료 API 과부하 방지를 위해 자막을 가볍게 정제"""
     lines = text.split()
     joined = " ".join(lines)
-    # 핵심 구간 위주로 압축
     return joined[:max_chars]
 
 def summarize_with_gemini(client, prompt):
-    # 무료 티어에서 가장 처리 성공률이 높은 flash 모델 단일화 + 충분한 대기 시간
-    model_name = 'gemini-1.5-flash'
+    # 구글 안내 기준 신규 키 지원 모델 지정
+    model_name = 'gemini-3.8-flash'
+    last_error = ""
     
     for attempt in range(1, 4):
         try:
-            print(f"[{model_name}] 요약 시도 중... ({attempt}/3)")
+            print(f"[{model_name}] 요약 요청 시도 ({attempt}/3)...")
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt
@@ -73,11 +67,11 @@ def summarize_with_gemini(client, prompt):
             if response and response.text:
                 return response.text.strip()
         except Exception as e:
-            print(f"시도 {attempt} 실패: {e}")
-            # 서버 과부하 완화를 위해 8초, 16초씩 넉넉히 대기
-            time.sleep(attempt * 8)
+            last_error = str(e)
+            print(f"시도 {attempt} 실패 상세: {last_error}")
+            time.sleep(attempt * 5)
                 
-    return "요약 생성 실패: 무료 서버 과부하로 응답을 가져오지 못했습니다. 잠시 후 재시도해 주세요."
+    return f"요약 생성 실패. 상세 사유: {last_error[:300]}"
 
 def main():
     is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -98,23 +92,19 @@ def main():
         print("채널에서 영상을 찾을 수 없습니다.")
         return
 
-    target_videos = []
-    
-    # 수동 테스트 시: 최근 올라온 영상 최대 3개만 추출하여 테스트 (과부하 방지)
-    # 예약 실행 시: 지정 시간대(00시~08시) 영상 전체 추출
-    entries = feed.entries if not is_manual else feed.entries[:3]
+    # 수동 테스트 시 최근 영상 최대 2개만 집중 추출
+    entries = feed.entries[:2] if is_manual else feed.entries
 
+    target_videos = []
     for entry in entries:
         published_utc = datetime.fromisoformat(entry.published)
         published_kst = published_utc.astimezone(kst)
 
-        # 수동 실행이거나 시간대 조건에 부합할 때
         if is_manual or (start_time <= published_kst <= end_time):
             video_id = entry.yt_videoid
             video_title = entry.title
             video_desc = entry.get('summary', '')
 
-            # 자막 추출
             transcript_text = ""
             try:
                 t_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ko', 'en'])
@@ -134,10 +124,8 @@ def main():
         print("수집 대상 영상이 없습니다.")
         return
 
-    # 시간순 정렬 (최신 정보 덮어쓰기 보장)
     target_videos.sort(key=lambda x: x["time"])
 
-    # 제미나이 전달용 텍스트 구축
     combined_script = ""
     for idx, v in enumerate(target_videos, 1):
         combined_script += f"\n[영상 {idx}]\n"
@@ -145,7 +133,6 @@ def main():
         combined_script += f"업로드: {v['time'].strftime('%Y-%m-%d %H:%M')}\n"
         combined_script += f"내용(요약 자막): {v['content']}\n"
 
-    # 타깃 추출 프롬프트
     prompt = f"""
 당신은 주식 매매 추천 데이터를 추출하는 비서입니다.
 아래 {len(target_videos)}개의 유튜브 영상 자막을 분석하여 다음 양식대로 정리하세요.
