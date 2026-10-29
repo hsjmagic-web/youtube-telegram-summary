@@ -18,13 +18,12 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # ==========================================
-# [설정] 수집 대상 시간대 (한국 시간 KST 기준)
+# [설정] 수집 대상 시간대 (KST 기준)
 # 기본값: 당일 00:00 ~ 당일 08:00
-# 추후 전일 22:00부터 수집하고 싶으실 때는 아래 START_DAYS_AGO = 1, START_HOUR = 22 로 변경하시면 됩니다.
 # ==========================================
-START_DAYS_AGO = 0   # 0이면 당일, 1이면 전일
-START_HOUR = 0       # 시작 시 (00시)
-END_HOUR = 8         # 종료 시 (08시)
+START_DAYS_AGO = 0
+START_HOUR = 0
+END_HOUR = 8
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -53,23 +52,32 @@ def is_korean_trading_day():
 
     return True
 
+def clean_and_shrink_text(text, max_chars=1800):
+    """무료 API 과부하 방지를 위해 자막을 가볍게 정제"""
+    lines = text.split()
+    joined = " ".join(lines)
+    # 핵심 구간 위주로 압축
+    return joined[:max_chars]
+
 def summarize_with_gemini(client, prompt):
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
+    # 무료 티어에서 가장 처리 성공률이 높은 flash 모델 단일화 + 충분한 대기 시간
+    model_name = 'gemini-1.5-flash'
     
-    for model_name in models_to_try:
-        for attempt in range(1, 4):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt
-                )
-                if response and response.text:
-                    return response.text.strip()
-            except Exception as e:
-                print(f"[{model_name}] 시도 {attempt} 실패: {e}")
-                time.sleep(attempt * 3)
+    for attempt in range(1, 4):
+        try:
+            print(f"[{model_name}] 요약 시도 중... ({attempt}/3)")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+            if response and response.text:
+                return response.text.strip()
+        except Exception as e:
+            print(f"시도 {attempt} 실패: {e}")
+            # 서버 과부하 완화를 위해 8초, 16초씩 넉넉히 대기
+            time.sleep(attempt * 8)
                 
-    return "요약 생성 실패: 제미나이 서버 응답 지연"
+    return "요약 생성 실패: 무료 서버 과부하로 응답을 가져오지 못했습니다. 잠시 후 재시도해 주세요."
 
 def main():
     is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -79,13 +87,9 @@ def main():
     kst = zoneinfo.ZoneInfo("Asia/Seoul")
     now_kst = datetime.now(kst)
 
-    # 수집 기준 시간 계산 (KST 기준)
-    # 시작 시간: 당일 00:00:00 (START_DAYS_AGO 설정 반영)
     start_time = (now_kst - timedelta(days=START_DAYS_AGO)).replace(hour=START_HOUR, minute=0, second=0, microsecond=0)
-    # 종료 시간: 당일 08:00:00
     end_time = now_kst.replace(hour=END_HOUR, minute=0, second=0, microsecond=0)
 
-    # 수동 테스트 시 안전장치: 현재 시각이 8시 이전이면 현재 시각까지 검사
     if is_manual and end_time < start_time:
         end_time = now_kst
 
@@ -94,81 +98,80 @@ def main():
         print("채널에서 영상을 찾을 수 없습니다.")
         return
 
-    # 대상 시간대 영상 필터링
     target_videos = []
-    for entry in feed.entries:
-        # 유튜브 RSS의 published_dt는 UTC 기준이므로 KST로 변환
+    
+    # 수동 테스트 시: 최근 올라온 영상 최대 3개만 추출하여 테스트 (과부하 방지)
+    # 예약 실행 시: 지정 시간대(00시~08시) 영상 전체 추출
+    entries = feed.entries if not is_manual else feed.entries[:3]
+
+    for entry in entries:
         published_utc = datetime.fromisoformat(entry.published)
         published_kst = published_utc.astimezone(kst)
 
-        if start_time <= published_kst <= end_time or is_manual:
+        # 수동 실행이거나 시간대 조건에 부합할 때
+        if is_manual or (start_time <= published_kst <= end_time):
             video_id = entry.yt_videoid
             video_title = entry.title
-            video_url = entry.link
             video_desc = entry.get('summary', '')
 
             # 자막 추출
             transcript_text = ""
             try:
                 t_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ko', 'en'])
-                transcript_text = " ".join([item['text'] for item in t_list])
+                raw_text = " ".join([item['text'] for item in t_list])
+                transcript_text = clean_and_shrink_text(raw_text, max_chars=1800)
             except Exception:
-                transcript_text = video_desc
+                transcript_text = clean_and_shrink_text(video_desc, max_chars=800)
 
             target_videos.append({
                 "id": video_id,
                 "title": video_title,
-                "url": video_url,
                 "time": published_kst,
                 "content": transcript_text
             })
 
     if not target_videos:
-        print(f"지정된 시간대({start_time.strftime('%H:%M')} ~ {end_time.strftime('%H:%M')})에 업로드된 영상이 없습니다.")
+        print("수집 대상 영상이 없습니다.")
         return
 
-    # 영상을 시간 순(오래된 순 -> 최신 순)으로 정렬 (최신 정보 덮어쓰기 보장 목적)
+    # 시간순 정렬 (최신 정보 덮어쓰기 보장)
     target_videos.sort(key=lambda x: x["time"])
 
-    # 제미나이에 넘길 통합 텍스트 구성
+    # 제미나이 전달용 텍스트 구축
     combined_script = ""
     for idx, v in enumerate(target_videos, 1):
-        combined_script += f"\n--- [영상 {idx}] ---\n"
+        combined_script += f"\n[영상 {idx}]\n"
         combined_script += f"제목: {v['title']}\n"
-        combined_script += f"업로드시간: {v['time'].strftime('%Y-%m-%d %H:%M')}\n"
-        combined_script += f"내용(자막): {v['content'][:4000]}\n"
+        combined_script += f"업로드: {v['time'].strftime('%Y-%m-%d %H:%M')}\n"
+        combined_script += f"내용(요약 자막): {v['content']}\n"
 
-    # 정밀 타깃 추출 프롬프트
+    # 타깃 추출 프롬프트
     prompt = f"""
-당신은 주식 매매 추천 정보를 정확히 구조화하는 전문 비서입니다.
-아래에 수집된 {len(target_videos)}개의 유튜브 영상 정보를 분석하여 다음 규칙에 따라 정리해 주세요.
+당신은 주식 매매 추천 데이터를 추출하는 비서입니다.
+아래 {len(target_videos)}개의 유튜브 영상 자막을 분석하여 다음 양식대로 정리하세요.
 
-[정리 규칙]
-1. 작성자(분석가/전문가)별로 그룹화하세요.
-   - 작성자는 영상 제목 끝이나 자막 인사말(예: "광수", "마스터" 등)에서 식별하세요. 파악이 어려우면 "기타/공통"으로 표기하세요.
-2. 각 작성자가 추천하거나 핵심 분석한 종목들을 추출하세요.
-   - 반드시 추출할 항목:
-     • 종목명
-     • 매수 추천 금액 (또는 매수 유효 구간)
-     • 손절 기준 금액
-     • 매도 기준 및 비율 (예: 1차 목표가 및 비중, 추세 매도선 등)
-3. 중복 종목 최신화 규칙 (매우 중요):
-   - 같은 작성자가 여러 영상에서 동일한 종목을 언급한 경우, 시간순으로 가장 마지막(최신) 영상에서 제시한 매수가, 손절가, 매도 기준을 채택해 덮어쓰기하세요.
-4. 만약 영상에서 특정 가격(매수가/손절가 등)을 구체적으로 언급하지 않았다면 임의로 지어내지 말고 "언급 없음"으로 표기하세요.
-5. 텔레그램으로 전송될 메시지이므로 가독성 좋게 글머리 기호(•, 📌)를 사용하여 깔끔한 텍스트로 출력하세요.
+[규칙]
+1. 작성자(예: 광수 등)별로 그룹화하세요. (파악 불가 시 '공통/기타')
+2. 각 작성자가 언급한 종목별로 다음 4가지 정보를 추출하세요:
+   - 종목명
+   - 매수 추천 금액 (또는 매수 구간)
+   - 손절 기준 금액
+   - 매도 기준 및 비율
+3. 중복 종목 최신화:
+   - 같은 작성자가 여러 영상에서 동일 종목을 언급했다면, 시간상 가장 최신 영상의 가격/기준으로 작성하세요.
+4. 구체적인 금액이나 기준이 언급되지 않았다면 지어내지 말고 '언급 없음'으로 표기하세요.
+5. 텔레그램 메시지이므로 보기 쉽게 깔끔한 글머리 기호(📌, •)로 작성하세요.
 
-[수집된 영상 데이터]
+[데이터]
 {combined_script}
 """
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     summary_result = summarize_with_gemini(client, prompt)
 
-    # 텔레그램 최종 메시지 구성
     report_date = now_kst.strftime('%Y-%m-%d')
-    final_message = f"📢 [당일 추천 종목 종합 브리핑]\n📅 기준일: {report_date} (00:00~08:00 업로드분)\n\n{summary_result}"
+    final_message = f"📢 [추천 종목 브리핑]\n📅 기준: {report_date}\n\n{summary_result}"
 
-    # 텔레그램 메시지 길이 제한(4096자) 대응: 길 경우 분할 전송
     if len(final_message) > 4000:
         for chunk in [final_message[i:i+3900] for i in range(0, len(final_message), 3900)]:
             send_telegram(chunk)
@@ -176,7 +179,7 @@ def main():
     else:
         send_telegram(final_message)
 
-    print(f"총 {len(target_videos)}개 영상 취합 및 텔레그램 발송 완료.")
+    print(f"총 {len(target_videos)}개 영상 분석 및 전송 완료.")
 
 if __name__ == "__main__":
     main()
