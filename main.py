@@ -1,14 +1,20 @@
 import os
-import sys
+import re
+import json
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import zoneinfo
+
 import holidays
 import feedparser
-from youtube_transcript_api import YouTubeTranscriptApi
-from google import genai
 import requests
+from google import genai
+from google.genai import types
 
+# ==========================================
+# [기본 설정]
+# ==========================================
 CHANNEL_ID = "UCYeL__ckkLfpnZzM7iBVktA"
 RSS_URL = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
 
@@ -16,157 +22,263 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# 우선 사용할 모델 (없으면 내 키로 쓸 수 있는 최신 flash 모델을 자동 선택)
+PREFERRED_MODEL = "gemini-3.8-flash"
+
+# 동시에 일하는 작업자(AI) 수. 무료 키는 2 권장 (늘리면 429 한도 초과가 날 수 있음)
+MAX_WORKERS = 2
+
+# 수집 시간대 (한국 시간 기준). 전일 22시부터 보려면 START_DAYS_AGO = 1, START_HOUR = 22
 START_DAYS_AGO = 0
 START_HOUR = 0
 END_HOUR = 8
 
+# 수동 실행(Run workflow) 시 테스트할 최신 영상 개수
+MANUAL_TEST_COUNT = 2
+
+KST = zoneinfo.ZoneInfo("Asia/Seoul")
+
+
+# ==========================================
+# 텔레그램 전송
+# ==========================================
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True
-    }
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"텔레그램 전송 실패: {e}")
+    chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)] or [""]
+    for chunk in chunks:
+        try:
+            r = requests.post(
+                url,
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk,
+                      "disable_web_page_preview": True},
+                timeout=15,
+            )
+            if r.status_code != 200:
+                print(f"텔레그램 전송 실패: {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            print(f"텔레그램 전송 오류: {e}")
+        time.sleep(1)
 
+
+# ==========================================
+# 평일/공휴일 확인
+# ==========================================
 def is_korean_trading_day():
-    kst = zoneinfo.ZoneInfo("Asia/Seoul")
-    today = datetime.now(kst).date()
-
+    today = datetime.now(KST).date()
     if today.weekday() >= 5:
-        print(f"[{today}] 주말이므로 작업을 종료합니다.")
+        print(f"[{today}] 주말이므로 종료합니다.")
         return False
-
     kr_holidays = holidays.SouthKorea(years=today.year)
     if today in kr_holidays:
-        print(f"[{today}] 공휴일({kr_holidays.get(today)})이므로 작업을 종료합니다.")
+        print(f"[{today}] 공휴일({kr_holidays.get(today)})이므로 종료합니다.")
         return False
-
     return True
 
-def clean_and_shrink_text(text, max_chars=1800):
-    lines = text.split()
-    joined = " ".join(lines)
-    return joined[:max_chars]
 
-def summarize_with_gemini(client, prompt):
-    # 구글 안내 기준 신규 키 지원 모델 지정
-    model_name = 'gemini-3.8-flash'
+# ==========================================
+# 사용할 모델 자동 선택
+# ==========================================
+def pick_model(client):
+    try:
+        names = []
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or []
+            if "generateContent" in actions:
+                names.append(m.name.replace("models/", ""))
+    except Exception as e:
+        print(f"모델 목록 조회 실패({e}) → 기본 모델 사용")
+        return PREFERRED_MODEL
+
+    if PREFERRED_MODEL in names:
+        return PREFERRED_MODEL
+
+    exclude = ("lite", "image", "tts", "live", "audio", "embedding", "preview", "exp")
+    cands = [n for n in names if n.startswith("gemini-") and "flash" in n
+             and not any(x in n for x in exclude)]
+    if not cands:
+        cands = [n for n in names if "flash" in n]
+
+    def version(n):
+        m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return float(m.group(1)) if m else 0.0
+
+    cands.sort(key=version, reverse=True)
+    print(f"사용 가능한 flash 모델: {cands}")
+    return cands[0] if cands else PREFERRED_MODEL
+
+
+# ==========================================
+# 작업자 1명이 영상 1개를 분석
+# ==========================================
+EXTRACT_PROMPT = """당신은 주식 유튜브 영상에서 매매 정보를 정확히 뽑아내는 비서입니다.
+영상 제목: {title}
+
+아래 JSON 형식으로만 답하세요. 다른 말은 쓰지 마세요.
+{{
+  "author": "영상 진행자(분석가) 이름. 제목 끝이나 인사말에서 찾고, 모르면 '기타'",
+  "stocks": [
+    {{
+      "name": "종목명",
+      "buy": "매수 추천 금액 또는 매수 구간",
+      "stop": "손절 기준 금액",
+      "sell": "매도 기준 및 비율"
+    }}
+  ]
+}}
+
+규칙:
+- 영상에서 구체적으로 추천하거나 매매 기준을 제시한 종목만 넣으세요.
+- 금액이나 기준을 말하지 않았으면 절대 지어내지 말고 "언급 없음"이라고 쓰세요.
+- 추천 종목이 하나도 없으면 "stocks": [] 로 두세요.
+"""
+
+
+def parse_json(text):
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+    return json.loads(text)
+
+
+def call_gemini(client, model, contents, config):
     last_error = ""
-    
     for attempt in range(1, 4):
         try:
-            print(f"[{model_name}] 요약 요청 시도 ({attempt}/3)...")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-            if response and response.text:
-                return response.text.strip()
+            resp = client.models.generate_content(model=model, contents=contents, config=config)
+            if resp and resp.text:
+                return parse_json(resp.text), ""
+            last_error = "빈 응답"
         except Exception as e:
             last_error = str(e)
-            print(f"시도 {attempt} 실패 상세: {last_error}")
-            time.sleep(attempt * 5)
-                
-    return f"요약 생성 실패. 상세 사유: {last_error[:300]}"
+            print(f"  시도 {attempt}/3 실패: {last_error[:200]}")
+        if attempt < 3:
+            time.sleep(20 * attempt)  # 20초, 40초 대기 후 재시도
+    return None, last_error
 
+
+def analyze_video(client, model, video):
+    prompt = EXTRACT_PROMPT.format(title=video["title"])
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        temperature=0.1,
+        media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
+    )
+
+    # 1순위: 영상 주소를 제미나이에게 직접 전달 (자막 불필요)
+    print(f"[분석 시작] {video['title'][:40]}")
+    contents = types.Content(parts=[
+        types.Part(file_data=types.FileData(file_uri=video["url"])),
+        types.Part(text=prompt),
+    ])
+    data, err = call_gemini(client, model, contents, config)
+
+    # 2순위: 실패하면 제목+설명란으로라도 분석
+    if data is None:
+        print(f"  영상 직접 분석 실패 → 설명란으로 재시도")
+        text_prompt = prompt + "\n\n[영상 설명란]\n" + video["desc"][:3000]
+        data, err2 = call_gemini(client, model, text_prompt,
+                                 types.GenerateContentConfig(
+                                     response_mime_type="application/json",
+                                     temperature=0.1))
+        if data is not None:
+            data["note"] = "설명란 기준(영상 분석 실패)"
+        else:
+            err = err2 or err
+
+    return {"video": video, "data": data, "error": err}
+
+
+# ==========================================
+# 결과를 작성자별로 합치기 (코드가 처리)
+# ==========================================
+def build_report(results, report_date, model):
+    results.sort(key=lambda r: r["video"]["time"])  # 오래된 → 최신 순
+    authors = {}
+    failures = []
+
+    for r in results:
+        if r["data"] is None:
+            failures.append(f"• {r['video']['title'][:40]}\n  사유: {r['error'][:150]}")
+            continue
+        author = (r["data"].get("author") or "기타").strip()
+        bucket = authors.setdefault(author, {})
+        for s in r["data"].get("stocks", []) or []:
+            name = (s.get("name") or "").strip()
+            if not name:
+                continue
+            # 같은 작성자가 같은 종목을 다시 말하면 최신 영상 값으로 덮어씀
+            bucket[name] = {**s, "time": r["video"]["time"].strftime("%H:%M"),
+                            "note": r["data"].get("note", "")}
+
+    lines = [f"📢 [추천 종목 종합 브리핑]", f"📅 기준일: {report_date}", ""]
+    if not any(authors.values()):
+        lines.append("분석한 영상에서 구체적인 추천 종목이 나오지 않았습니다.")
+    for author, stocks in authors.items():
+        if not stocks:
+            continue
+        lines += ["====================", f"👤 분석가: {author}", "===================="]
+        for name, s in stocks.items():
+            lines.append(f"📌 {name}  (영상 {s['time']})")
+            lines.append(f"• 매수 추천가: {s.get('buy') or '언급 없음'}")
+            lines.append(f"• 손절 기준가: {s.get('stop') or '언급 없음'}")
+            lines.append(f"• 매도 기준·비율: {s.get('sell') or '언급 없음'}")
+            if s.get("note"):
+                lines.append(f"• 참고: {s['note']}")
+            lines.append("")
+
+    if failures:
+        lines += ["⚠️ 분석 실패 영상", *failures]
+    lines.append(f"\n(분석 영상 {len(results)}개 · 모델 {model})")
+    return "\n".join(lines)
+
+
+# ==========================================
+# 메인
+# ==========================================
 def main():
     is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
     if not is_manual and not is_korean_trading_day():
         return
 
-    kst = zoneinfo.ZoneInfo("Asia/Seoul")
-    now_kst = datetime.now(kst)
-
-    start_time = (now_kst - timedelta(days=START_DAYS_AGO)).replace(hour=START_HOUR, minute=0, second=0, microsecond=0)
+    now_kst = datetime.now(KST)
+    start_time = (now_kst - timedelta(days=START_DAYS_AGO)).replace(
+        hour=START_HOUR, minute=0, second=0, microsecond=0)
     end_time = now_kst.replace(hour=END_HOUR, minute=0, second=0, microsecond=0)
-
-    if is_manual and end_time < start_time:
-        end_time = now_kst
 
     feed = feedparser.parse(RSS_URL)
     if not feed.entries:
         print("채널에서 영상을 찾을 수 없습니다.")
         return
 
-    # 수동 테스트 시 최근 영상 최대 2개만 집중 추출
-    entries = feed.entries[:2] if is_manual else feed.entries
-
-    target_videos = []
-    for entry in entries:
-        published_utc = datetime.fromisoformat(entry.published)
-        published_kst = published_utc.astimezone(kst)
-
+    entries = feed.entries[:MANUAL_TEST_COUNT] if is_manual else feed.entries
+    videos = []
+    for e in entries:
+        published_kst = datetime.fromisoformat(e.published).astimezone(KST)
         if is_manual or (start_time <= published_kst <= end_time):
-            video_id = entry.yt_videoid
-            video_title = entry.title
-            video_desc = entry.get('summary', '')
-
-            transcript_text = ""
-            try:
-                t_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ko', 'en'])
-                raw_text = " ".join([item['text'] for item in t_list])
-                transcript_text = clean_and_shrink_text(raw_text, max_chars=1800)
-            except Exception:
-                transcript_text = clean_and_shrink_text(video_desc, max_chars=800)
-
-            target_videos.append({
-                "id": video_id,
-                "title": video_title,
+            videos.append({
+                "title": e.title,
+                "url": f"https://www.youtube.com/watch?v={e.yt_videoid}",
                 "time": published_kst,
-                "content": transcript_text
+                "desc": e.get("summary", ""),
             })
 
-    if not target_videos:
-        print("수집 대상 영상이 없습니다.")
+    if not videos:
+        print(f"{start_time:%m-%d %H:%M} ~ {end_time:%H:%M} 사이 업로드된 영상이 없습니다.")
         return
 
-    target_videos.sort(key=lambda x: x["time"])
-
-    combined_script = ""
-    for idx, v in enumerate(target_videos, 1):
-        combined_script += f"\n[영상 {idx}]\n"
-        combined_script += f"제목: {v['title']}\n"
-        combined_script += f"업로드: {v['time'].strftime('%Y-%m-%d %H:%M')}\n"
-        combined_script += f"내용(요약 자막): {v['content']}\n"
-
-    prompt = f"""
-당신은 주식 매매 추천 데이터를 추출하는 비서입니다.
-아래 {len(target_videos)}개의 유튜브 영상 자막을 분석하여 다음 양식대로 정리하세요.
-
-[규칙]
-1. 작성자(예: 광수 등)별로 그룹화하세요. (파악 불가 시 '공통/기타')
-2. 각 작성자가 언급한 종목별로 다음 4가지 정보를 추출하세요:
-   - 종목명
-   - 매수 추천 금액 (또는 매수 구간)
-   - 손절 기준 금액
-   - 매도 기준 및 비율
-3. 중복 종목 최신화:
-   - 같은 작성자가 여러 영상에서 동일 종목을 언급했다면, 시간상 가장 최신 영상의 가격/기준으로 작성하세요.
-4. 구체적인 금액이나 기준이 언급되지 않았다면 지어내지 말고 '언급 없음'으로 표기하세요.
-5. 텔레그램 메시지이므로 보기 쉽게 깔끔한 글머리 기호(📌, •)로 작성하세요.
-
-[데이터]
-{combined_script}
-"""
-
     client = genai.Client(api_key=GEMINI_API_KEY)
-    summary_result = summarize_with_gemini(client, prompt)
+    model = pick_model(client)
+    print(f"선택된 모델: {model} / 분석 대상 {len(videos)}개 / 동시 작업자 {MAX_WORKERS}명")
 
-    report_date = now_kst.strftime('%Y-%m-%d')
-    final_message = f"📢 [추천 종목 브리핑]\n📅 기준: {report_date}\n\n{summary_result}"
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = [pool.submit(analyze_video, client, model, v) for v in videos]
+        for f in as_completed(futures):
+            results.append(f.result())
 
-    if len(final_message) > 4000:
-        for chunk in [final_message[i:i+3900] for i in range(0, len(final_message), 3900)]:
-            send_telegram(chunk)
-            time.sleep(1)
-    else:
-        send_telegram(final_message)
+    report = build_report(results, now_kst.strftime("%Y-%m-%d"), model)
+    print(report)
+    send_telegram(report)
 
-    print(f"총 {len(target_videos)}개 영상 분석 및 전송 완료.")
 
 if __name__ == "__main__":
     main()
