@@ -4,7 +4,7 @@ on:
   schedule:
     # 매일 한국 시간(KST) 오전 7시 실행 (UTC 기준 22:00)
     - cron: '0 22 * * *'
-  # 원할 때 수동으로 즉시 실행해볼 수 있는 버튼 활성화
+  # 수동 실행 버튼
   workflow_dispatch:
 
 jobs:
@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 파이썬 설치
-        uses: setup-python@v5
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
