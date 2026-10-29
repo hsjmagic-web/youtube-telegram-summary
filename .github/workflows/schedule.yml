@@ -2,13 +2,14 @@ name: Daily YouTube Summary
 
 on:
   schedule:
-    # 한국 시간 기준 월~금요일 오전 08:00 실행 (UTC 기준 일~목요일 23:00)
+    # 한국 시간 월~금 오전 08:00 (UTC 일~목 23:00)
     - cron: '0 23 * * 0-4'
   workflow_dispatch:
 
 jobs:
   run-summary:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: 저장소 체크아웃
         uses: actions/checkout@v4
@@ -20,7 +21,7 @@ jobs:
 
       - name: 필요한 패키지 설치
         run: |
-          pip install feedparser youtube-transcript-api google-genai requests holidays
+          pip install --upgrade feedparser google-genai requests holidays
 
       - name: 스크립트 실행
         env:
