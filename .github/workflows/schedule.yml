@@ -1,0 +1,31 @@
+name: Daily YouTube Summary
+
+on:
+  schedule:
+    # 매일 한국 시간(KST) 오전 7시 실행 (UTC 기준 22:00)
+    - cron: '0 22 * * *'
+  # 원할 때 수동으로 즉시 실행해볼 수 있는 버튼 활성화
+  workflow_dispatch:
+
+jobs:
+  run-summary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설치
+        uses: setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 필요한 패키지 설치
+        run: |
+          pip install feedparser youtube-transcript-api google-genai requests
+
+      - name: 스크립트 실행
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python main.py
